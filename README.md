@@ -52,6 +52,27 @@ pm usr logout        # Lock vault
 
 Group aliases: `user` for `usr`, `pass` for `pss`.
 
+## Web UI
+
+Start the localhost web interface:
+
+```bash
+pm-web
+# or
+pm web start
+```
+
+Open **http://127.0.0.1:8765** in your browser.
+
+The web UI uses the same encrypted vault as the CLI. You can list, search, copy, add, edit, and delete entries from the browser. Sessions auto-lock after 30 minutes.
+
+**Security notes for web use:**
+
+- The server binds to `127.0.0.1` only (not accessible from other machines).
+- Web sessions are stored in memory (not written to disk like the CLI session file).
+- CLI and web have separate login sessions; avoid writing to the vault from both at the same time.
+- Use the **Lock** button when finished.
+
 ## Security notes
 
 - Master password is never stored; only a derived key verifier (SHA-256 of Fernet key) is kept in `meta.json`.

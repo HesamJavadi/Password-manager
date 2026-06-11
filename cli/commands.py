@@ -1,32 +1,23 @@
 import getpass
-import json
-import secrets
-import string
-from datetime import datetime
 
 import pyperclip
 import typer
-from cryptography.fernet import InvalidToken
 
+from core import service
 from core.session import clear_session, load_session, save_session, session_info
 from core.storage import VAULT_DIR, load_meta
-from core.vault import (
-    vault_change_password,
-    vault_init,
-    vault_login,
-    vault_read,
-    vault_write,
-)
 from models.PasswordEntry import PasswordEntry
 
 app = typer.Typer(help="CLI password manager")
 user_typer = typer.Typer(help="Vault and session commands")
 pass_typer = typer.Typer(help="Password entry commands")
+web_typer = typer.Typer(help="Web UI commands")
 
 app.add_typer(user_typer, name="usr")
 app.add_typer(user_typer, name="user")
 app.add_typer(pass_typer, name="pss")
 app.add_typer(pass_typer, name="pass")
+app.add_typer(web_typer, name="web")
 
 
 def require_session() -> bytes:
@@ -39,20 +30,10 @@ def require_session() -> bytes:
 
 def read_vault(key: bytes) -> list:
     try:
-        return vault_read(key)
-    except InvalidToken:
-        typer.echo("✗ Vault corrupted or session expired. Run: pm usr login", err=True)
+        return service.read_vault(key)
+    except service.VaultCorruptedError as e:
+        typer.echo(f"✗ {e}. Run: pm usr login", err=True)
         raise typer.Exit(1)
-    except json.JSONDecodeError:
-        typer.echo("✗ Vault data is corrupted", err=True)
-        raise typer.Exit(1)
-
-
-def find_entry(entries: list, name: str) -> dict | None:
-    for entry in entries:
-        if entry["title"].lower() == name.lower():
-            return entry
-    return None
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -79,7 +60,11 @@ def init():
         raise typer.Exit(1)
 
     username = getpass.getuser()
-    key = vault_init(username, password)
+    try:
+        key = service.init_vault(username, password)
+    except service.VaultExistsError:
+        typer.echo("✗ Vault already exists! Use: pm usr login", err=True)
+        raise typer.Exit(1)
     save_session(key)
     typer.echo(f"✓ Vault initialized for '{username}'")
     typer.echo(f"  Vault location: {VAULT_DIR}")
@@ -97,8 +82,9 @@ def stpass():
         old_key = load_session()
     except PermissionError:
         current = getpass.getpass(prompt="Current master password: ")
-        old_key = vault_login(username, current)
-        if old_key is None:
+        try:
+            old_key = service.login(username, current)
+        except service.InvalidCredentialsError:
             typer.echo("✗ Invalid current password!", err=True)
             raise typer.Exit(1)
 
@@ -108,7 +94,7 @@ def stpass():
         typer.echo("✗ Passwords do not match!", err=True)
         raise typer.Exit(1)
 
-    new_key = vault_change_password(old_key, new_password, username)
+    new_key = service.change_master_password(old_key, new_password, username)
     save_session(new_key)
     typer.echo(f"✓ Master password changed for '{username}'")
 
@@ -124,9 +110,9 @@ def login():
     password = getpass.getpass("Master password: ")
     username = getpass.getuser()
 
-    key = vault_login(username, password)
-
-    if key is None:
+    try:
+        key = service.login(username, password)
+    except service.InvalidCredentialsError:
         typer.echo("✗ Invalid password!", err=True)
         raise typer.Exit(1)
 
@@ -181,13 +167,6 @@ def add(
     notes: str = typer.Option("", "--notes", prompt="Notes (optional)", help="Notes"),
 ):
     key = require_session()
-    entries = read_vault(key)
-
-    for entry in entries:
-        if entry["title"].lower() == title.lower():
-            typer.echo(f"✗ Entry '{title}' already exists!", err=True)
-            raise typer.Exit(1)
-
     new_entry = PasswordEntry(
         title=title,
         username=username,
@@ -195,9 +174,11 @@ def add(
         url=url,
         notes=notes,
     )
-
-    entries.append(new_entry.to_dict())
-    vault_write(entries, key)
+    try:
+        service.add_entry(key, new_entry)
+    except service.EntryExistsError as e:
+        typer.echo(f"✗ {e}", err=True)
+        raise typer.Exit(1)
     typer.echo(f"✓ '{title}' added successfully!")
 
 
@@ -207,22 +188,18 @@ def use(
     password: str = typer.Option(..., "--password", "-p", prompt=True, hide_input=True, help="Password"),
 ):
     key = require_session()
-    entries = read_vault(key)
-
-    for entry in entries:
-        if entry["title"].lower() == title.lower():
-            typer.echo(f"✗ Entry '{title}' already exists!", err=True)
-            raise typer.Exit(1)
-
     new_entry = PasswordEntry(title=title, password=password)
-    entries.append(new_entry.to_dict())
-    vault_write(entries, key)
+    try:
+        service.add_entry(key, new_entry)
+    except service.EntryExistsError as e:
+        typer.echo(f"✗ {e}", err=True)
+        raise typer.Exit(1)
     typer.echo(f"✓ '{title}' added successfully!")
 
 
 def _list_entries():
     key = require_session()
-    entries = read_vault(key)
+    entries = service.list_entries(key)
     if not entries:
         typer.echo("No passwords saved yet.")
         return
@@ -247,11 +224,10 @@ def show(
     reveal_password: bool = typer.Option(False, "--show", "-s", help="Reveal password"),
 ):
     key = require_session()
-    entries = read_vault(key)
-    entry = find_entry(entries, name)
-
-    if entry is None:
-        typer.echo(f"✗ Entry '{name}' not found!", err=True)
+    try:
+        entry = service.get_entry(key, name)
+    except service.EntryNotFoundError as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
 
     typer.echo(f"Title:    {entry['title']}")
@@ -269,45 +245,44 @@ def rm(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
     key = require_session()
-    entries = read_vault(key)
+    entries = service.list_entries(key)
 
     if not entries:
         typer.echo("No passwords saved yet.")
         raise typer.Exit(1)
 
-    matching = [e for e in entries if e["title"].lower() == name.lower()]
-    if not matching:
-        typer.echo(f"✗ Entry '{name}' not found!", err=True)
+    try:
+        matching = service.get_entry(key, name)
+    except service.EntryNotFoundError as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
 
     if not yes:
-        confirm = typer.confirm(f"Delete '{matching[0]['title']}'?")
+        confirm = typer.confirm(f"Delete '{matching['title']}'?")
         if not confirm:
             typer.echo("Cancelled.")
             raise typer.Exit(0)
 
-    remaining = [e for e in entries if e["title"].lower() != name.lower()]
-    vault_write(remaining, key)
-    typer.echo(f"✓ '{matching[0]['title']}' removed")
+    service.delete_entry(key, name)
+    typer.echo(f"✓ '{matching['title']}' removed")
 
 
 @pass_typer.command(help="Change the password for an entry")
 def edit(name: str = typer.Argument(..., help="Entry title")):
     key = require_session()
-    entries = read_vault(key)
+    entries = service.list_entries(key)
 
     if not entries:
         typer.echo("No passwords saved yet.")
         raise typer.Exit(1)
 
-    entry = find_entry(entries, name)
-    if entry is None:
-        typer.echo(f"✗ Entry '{name}' not found!", err=True)
+    try:
+        entry = service.update_entry_password(
+            key, name, getpass.getpass(prompt="Enter new password: ")
+        )
+    except service.EntryNotFoundError as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
-
-    entry["password"] = getpass.getpass(prompt="Enter new password: ")
-    entry["updated_at"] = datetime.now().isoformat()
-    vault_write(entries, key)
     typer.echo(f"✓ Password updated for '{entry['title']}'")
 
 
@@ -318,11 +293,10 @@ def get(
     copy: bool = typer.Option(False, "--copy", "-c", help="Copy password to clipboard"),
 ):
     key = require_session()
-    entries = read_vault(key)
-    entry = find_entry(entries, name)
-
-    if entry is None:
-        typer.echo(f"✗ Entry '{name}' not found!", err=True)
+    try:
+        entry = service.get_entry(key, name)
+    except service.EntryNotFoundError as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
 
     password_display = entry["password"] if show_pass else "••••••"
@@ -336,21 +310,9 @@ def get(
             raise typer.Exit(1)
 
 
-def _search(
-    query: str,
-    show_pass: bool = False,
-):
+def _search(query: str, show_pass: bool = False):
     key = require_session()
-    entries = read_vault(key)
-    q = query.lower()
-
-    results = [
-        entry for entry in entries
-        if q in entry["title"].lower()
-        or q in entry.get("username", "").lower()
-        or q in entry.get("url", "").lower()
-        or q in entry.get("notes", "").lower()
-    ]
+    results = service.search_entries(key, query)
 
     if not results:
         typer.echo(f"✗ No results for '{query}'", err=True)
@@ -384,21 +346,11 @@ def _generate(
     digits: bool = True,
     quiet: bool = False,
 ):
-    if length <= 0:
-        typer.echo("✗ Length must be greater than 0", err=True)
+    try:
+        password = service.generate_password(length, symbols=symbols, digits=digits)
+    except ValueError as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
-
-    chars = string.ascii_letters
-    if digits:
-        chars += string.digits
-    if symbols:
-        chars += string.punctuation
-
-    if not chars:
-        typer.echo("✗ No character set available (enable --digits or --symbols)", err=True)
-        raise typer.Exit(1)
-
-    password = "".join(secrets.choice(chars) for _ in range(length))
 
     if copy_to_clipboard(password):
         typer.echo("✓ Password copied to clipboard")
@@ -410,16 +362,12 @@ def _generate(
 
     if title:
         key = require_session()
-        entries = read_vault(key)
-
-        for entry in entries:
-            if entry["title"].lower() == title.lower():
-                typer.echo(f"✗ Entry '{title}' already exists!", err=True)
-                raise typer.Exit(1)
-
         new_entry = PasswordEntry(title=title, password=password)
-        entries.append(new_entry.to_dict())
-        vault_write(entries, key)
+        try:
+            service.add_entry(key, new_entry)
+        except service.EntryExistsError as e:
+            typer.echo(f"✗ {e}", err=True)
+            raise typer.Exit(1)
         typer.echo(f"✓ '{title}' added successfully!")
 
 
@@ -443,6 +391,16 @@ def generate_cmd(
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Do not print password to terminal"),
 ):
     _generate(length, title, symbols, digits, quiet)
+
+
+# --- web commands ---
+
+@web_typer.command(help="Start the localhost web UI")
+def start(
+    port: int = typer.Option(8765, "--port", "-p", help="Port to listen on"),
+):
+    from web.main import run_server
+    run_server(port=port)
 
 
 def cli():
