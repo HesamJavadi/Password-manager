@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "password-manager"
+version = "0.1.0"
+description = "A CLI password manager"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "cryptography>=42",
+    "pyperclip>=1.8",
+]
+
+[project.scripts]
+pm = "password_manager.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
